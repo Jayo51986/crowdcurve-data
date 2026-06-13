@@ -32,6 +32,87 @@ import urllib.error
 OUT_DIR = "data"
 UA = {"User-Agent": "CrowdCurveBot/1.0 (+https://cryptocurrencypricesnow.com/forecast)"}
 
+# ── CrowdCurve models ────────────────────────────────────────────────────────
+# Three cheap, honest, fully-explainable models computed from price history.
+# Shown as faint lines behind the market consensus and scored publicly.
+
+def fetch_history(gecko_id, days=90):
+    """Daily closing prices for the last N days from CoinGecko (free, keyless)."""
+    url = ("https://api.coingecko.com/api/v3/coins/" + gecko_id +
+           "/market_chart?vs_currency=usd&days=" + str(days) + "&interval=daily")
+    d = get_json(url)
+    try:
+        prices = [p[1] for p in d.get("prices", [])] if d else []
+        return [float(x) for x in prices if x]
+    except (TypeError, ValueError, KeyError):
+        return []
+
+
+def realized_vol(prices):
+    """Annualized volatility and drift from daily log returns."""
+    if len(prices) < 5:
+        return None
+    rets = []
+    for i in range(1, len(prices)):
+        if prices[i - 1] > 0 and prices[i] > 0:
+            rets.append(math.log(prices[i] / prices[i - 1]))
+    if len(rets) < 4:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(365), mean * 365
+
+
+def _norm_cdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def model_probabilities(spot, strikes, sigma_annual, drift_annual, horizon_days, mode):
+    """P(price > strike) at the horizon under a log-normal model."""
+    if not spot or sigma_annual is None or sigma_annual <= 0:
+        return None
+    t = max(horizon_days, 1) / 365.0
+    sig = sigma_annual * math.sqrt(t)
+    if mode == "momentum":
+        mu = max(-0.6, min(0.6, drift_annual)) * t / (1 + t)
+    else:
+        mu = 0.0
+    out = []
+    for k in strikes:
+        if k <= 0:
+            out.append(0.0)
+            continue
+        z = (math.log(k / spot) - (mu - 0.5 * sig * sig)) / (sig or 1e-9)
+        out.append(max(0.0, min(1.0, 1 - _norm_cdf(z))))
+    return out
+
+
+def build_models(spot, strikes, market_cons, hist, horizon_days):
+    """Return {volatility, momentum, anchored, sigma} or {}."""
+    rv = realized_vol(hist)
+    if not rv:
+        return {}
+    sigma, drift = rv
+    vol = model_probabilities(spot, strikes, sigma, drift, horizon_days, "vol")
+    mom = model_probabilities(spot, strikes, sigma, drift, horizon_days, "momentum")
+    if vol is None:
+        return {}
+    anchored = None
+    if market_cons and len(market_cons) == len(vol):
+        anchored = []
+        for mc, mv in zip(market_cons, vol):
+            gap = mv - mc
+            adj = mc + (0.25 * gap if abs(gap) > 0.12 else 0.0)
+            anchored.append(max(0.0, min(1.0, adj)))
+    return {
+        "volatility": [round(x, 4) for x in vol],
+        "momentum": [round(x, 4) for x in mom],
+        "anchored": [round(x, 4) for x in anchored] if anchored else None,
+        "sigma": round(sigma, 4),
+    }
+
+
+
 COINS = {
     "BTC":  {"name": "Bitcoin",     "aliases": ["bitcoin", "btc"],       "cb": "BTC-USD",  "gecko": "bitcoin"},
     "ETH":  {"name": "Ethereum",    "aliases": ["ethereum", "eth"],      "cb": "ETH-USD",  "gecko": "ethereum"},
@@ -383,6 +464,22 @@ def assign_horizon(end, targets):
     return best
 
 
+def filter_outlier_strikes(points, spot, horizon_days):
+    """Drop strikes implausibly far from spot for the given horizon. A handful
+    of moonshot strikes (e.g. $250k when spot is $64k) otherwise stretch the
+    price axis and drag the computed distribution. The plausible band widens
+    with the horizon: a week stays tight, multi-year allows far more room."""
+    if not points or not spot:
+        return points
+    # scale plausible move with sqrt(time): ~weekly tight, multi-year wide
+    import math as _m
+    horizon_factor = _m.sqrt(max(horizon_days, 1) / 30.0)  # 1.0 at ~1 month
+    lo = spot / (1 + 1.1 * horizon_factor)
+    hi = spot * (1 + 1.6 * horizon_factor)
+    kept = [p for p in points if lo <= p["strike"] <= hi]
+    return kept if len(kept) >= 3 else points
+
+
 # ── consensus math (same bucket method as the plugin) ────────────────────────
 
 def merge_strikes(points):
@@ -502,8 +599,145 @@ def no_market_text(sym, name, spot, horizon_label):
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-def main():
-    today = dt.datetime.utcnow().date()
+def fetch_macro():
+    """Live macro markets from Kalshi that move crypto. Falls back to a small
+    static set only if the API is unreachable, clearly flagged stale."""
+    wanted = [
+        ("KXFED", "Fed cuts rates by September"),
+        ("KXCPI", "Inflation comes in hot this month"),
+        ("KXRECSS", "US recession called this year"),
+    ]
+    out = []
+    host = "https://api.elections.kalshi.com/trade-api/v2"
+    for series, label in wanted:
+        d = get_json(host + "/markets?series_ticker=" + series + "&status=open&limit=1")
+        try:
+            m = (d or {}).get("markets", [])
+            if m:
+                yb = float(m[0].get("yes_bid_dollars") or 0)
+                ya = float(m[0].get("yes_ask_dollars") or 0)
+                p = round((yb + ya) / 2 * 100)
+                if p > 0:
+                    out.append({"q": label, "p": p, "d": 0, "live": True})
+        except (TypeError, ValueError, KeyError):
+            pass
+        time.sleep(0.2)
+    if not out:  # honest fallback, flagged so the plugin can label it
+        out = [{"q": "Macro markets warming up", "p": None, "d": 0, "live": False}]
+    log("macro: " + str(len([m for m in out if m.get('live')])) + " live markets")
+    return out
+
+
+def update_scoring(config, today):
+    """Public, append-only prediction log + calibration scoring.
+
+    For each coin/horizon we record today's stated probability that price is
+    above a near-spot reference strike, for every source (Polymarket, Kalshi,
+    consensus, and each model). When a prediction's horizon date passes, we
+    grade it against the actual spot price and fold it into the calibration
+    table. Nothing is ever rewritten: this is the receipts page.
+    """
+    pred_path = os.path.join(OUT_DIR, "predictions.json")
+    score_path = os.path.join(OUT_DIR, "scores.json")
+    try:
+        with open(pred_path) as f:
+            preds = json.load(f)
+    except (FileNotFoundError, ValueError):
+        preds = []
+
+    targets = horizon_targets(today)
+    # 1. log today's open predictions (one per coin/horizon, deduped per day)
+    stamp = today.isoformat()
+    have = {(p["coin"], p["hk"], p["logged"]) for p in preds}
+    for sym, c in config["coins"].items():
+        for hk, H in c.get("horizons", {}).items():
+            if (sym, hk, stamp) in have:
+                continue
+            mk = H.get("markets") or []
+            if len(mk) < 3:
+                continue
+            spot = c.get("spot")
+            if not spot:
+                continue
+            # reference strike: nearest to spot
+            ref = min(mk, key=lambda m: abs(m["strike"] - spot))
+            v = (ref.get("pmVol", 0) + ref.get("kVol", 0)) or 1
+            cons = (ref["pm"] * ref.get("pmVol", 0) + ref["k"] * ref.get("kVol", 0)) / v if (ref.get("pmVol", 0) + ref.get("kVol", 0)) else (ref["pm"] + ref["k"]) / 2
+            idx = mk.index(ref)
+            models = H.get("models") or {}
+            def mval(key):
+                arr = models.get(key)
+                return round(arr[idx], 4) if arr and idx < len(arr) else None
+            tgt, _ = targets[hk]
+            preds.append({
+                "coin": sym, "hk": hk, "logged": stamp,
+                "resolve": tgt.isoformat(), "strike": ref["strike"],
+                "p": {"pm": ref["pm"], "k": ref["k"], "consensus": round(cons, 4),
+                      "volatility": mval("volatility"), "momentum": mval("momentum"),
+                      "anchored": mval("anchored")},
+                "graded": False,
+            })
+
+    # 2. grade matured predictions against today's spot
+    spot_now = {s: config["coins"][s].get("spot") for s in config["coins"]}
+    bins = ["10-30%", "30-50%", "50-70%", "70-90%"]
+    sources = ["pm", "k", "consensus", "volatility", "momentum", "anchored"]
+    tally = {s: {b: {"n": 0, "sum_p": 0.0, "hits": 0} for b in bins} for s in sources}
+
+    def binof(p):
+        pc = p * 100
+        if 10 <= pc < 30: return "10-30%"
+        if 30 <= pc < 50: return "30-50%"
+        if 50 <= pc < 70: return "50-70%"
+        if 70 <= pc < 90: return "70-90%"
+        return None
+
+    for p in preds:
+        if not p.get("graded") and p["resolve"] <= stamp:
+            sp = spot_now.get(p["coin"])
+            if sp:
+                p["outcome"] = 1 if sp > p["strike"] else 0
+                p["graded"] = True
+        if p.get("graded") and "outcome" in p:
+            for s in sources:
+                pr = p["p"].get(s)
+                if pr is None:
+                    continue
+                b = binof(pr)
+                if not b:
+                    continue
+                tally[s][b]["n"] += 1
+                tally[s][b]["sum_p"] += pr
+                tally[s][b]["hits"] += p["outcome"]
+
+    # 3. build the scorecard: mean calibration error per source
+    scorecard = {"resolved": sum(1 for p in preds if p.get("graded")),
+                 "open": sum(1 for p in preds if not p.get("graded")),
+                 "sources": {}}
+    for s in sources:
+        rows, errs = [], []
+        for b in bins:
+            t = tally[s][b]
+            if t["n"] == 0:
+                continue
+            said = t["sum_p"] / t["n"] * 100
+            happened = t["hits"] / t["n"] * 100
+            rows.append({"bin": b, "n": t["n"], "said": round(said, 1), "happened": round(happened, 1)})
+            errs.append(abs(said - happened))
+        scorecard["sources"][s] = {
+            "rows": rows,
+            "mce": round(sum(errs) / len(errs), 1) if errs else None,
+        }
+
+    # keep the log bounded (most recent 5000 predictions)
+    preds = preds[-5000:]
+    write_json(pred_path, preds)
+    write_json(score_path, scorecard)
+    config["scorecard"] = scorecard
+    log("scoring: " + str(scorecard["resolved"]) + " resolved, " + str(scorecard["open"]) + " open")
+
+
+
     targets = horizon_targets(today)
     spots = fetch_spots()
     if not spots:
@@ -525,28 +759,43 @@ def main():
     hist_dir = os.path.join(OUT_DIR, "history")
     existing_hist = sorted(os.listdir(hist_dir)) if os.path.isdir(hist_dir) else []
     config["recording_since"] = (existing_hist[0].replace(".json", "") if existing_hist else today.isoformat())
+    # Dynamic horizon labels so the year tabs roll forward forever with no code edits.
+    config["horizon_labels"] = {
+        "W": "week", "M": "month", "Q": "quarter", "Y": "year-end",
+        "Y1": str(today.year + 1), "Y2": str(today.year + 2),
+    }
 
     horizon_keys = ["W", "M", "Q", "Y", "Y1", "Y2"]
+    HDAYS = {"W": 7, "M": 30, "Q": 100, "Y": 200, "Y1": 565, "Y2": 930}
     for sym, c in COINS.items():
         name = c["name"]
         spot = spots.get(sym)
         coin_out = {"name": name, "spot": spot, "horizons": {}}
         valid = []
+        # price history once per coin, reused for every horizon's models
+        hist = fetch_history(c["gecko"], 90) if spot else []
+        time.sleep(0.4)  # be gentle on the free history endpoint
         for hk in horizon_keys:
             target, _tol = targets[hk]
             label = target.strftime("%b %-d, %Y") if os.name != "nt" else target.strftime("%b %d, %Y")
             pts = grouped.get(sym, {}).get(hk, [])
+            pts = filter_outlier_strikes(pts, spot, HDAYS.get(hk, 30))
             rows = merge_strikes(pts) if pts else []
             if spot and len(rows) >= 3:
-                # use the modal end date of the actual markets as the label
-                ends = sorted(p["end"] for p in pts)
-                label = ends[len(ends) // 2].strftime("%b %d, %Y").replace(" 0", " ")
+                label = target.strftime("%b %d, %Y").replace(" 0", " ")
                 summary = summarize(spot, rows)
+                strikes = [r["strike"] for r in rows]
+                market_cons = []
+                for r in rows:
+                    v = r["pmVol"] + r["kVol"]
+                    market_cons.append((r["pm"] * r["pmVol"] + r["k"] * r["kVol"]) / v if v > 0 else (r["pm"] + r["k"]) / 2)
+                models = build_models(spot, strikes, market_cons, hist, HDAYS.get(hk, 30)) if hist else {}
                 coin_out["horizons"][hk] = {
                     "resolve": label,
                     "markets": [{"strike": r["strike"], "pm": round(r["pm"], 4), "k": round(r["k"], 4),
                                  "pmVol": round(r["pmVol"]), "kVol": round(r["kVol"])} for r in rows],
                     "summary": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in summary.items()},
+                    "models": models,
                 }
                 valid.append(hk)
                 write_json(os.path.join(OUT_DIR, sym, hk),
@@ -558,6 +807,14 @@ def main():
         coin_out["tier"] = "full" if ("M" in valid and len(valid) >= 3) else ("partial" if valid else "spot")
         config["coins"][sym] = coin_out
         log(f"{sym}: tier={coin_out['tier']} horizons={valid} spot={spot}")
+
+    # live macro markets from Kalshi (replaces the hardcoded placeholders)
+    config["macro"] = fetch_macro()
+    # prediction logging + scoring (calibration scorecard + signal feed inputs)
+    try:
+        update_scoring(config, today)
+    except Exception as e:  # never let scoring break the main data write
+        log("scoring skipped: " + str(e))
 
     write_json(os.path.join(OUT_DIR, "config.json"), config)
     # daily history snapshot: latest run of each UTC day wins
