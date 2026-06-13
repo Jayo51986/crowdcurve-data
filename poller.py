@@ -36,8 +36,27 @@ UA = {"User-Agent": "CrowdCurveBot/1.0 (+https://cryptocurrencypricesnow.com/for
 # Three cheap, honest, fully-explainable models computed from price history.
 # Shown as faint lines behind the market consensus and scored publicly.
 
-def fetch_history(gecko_id, days=90):
-    """Daily closing prices for the last N days from CoinGecko (free, keyless)."""
+def fetch_history(gecko_id, days=90, cb_pair=None):
+    """Daily closing prices for the last N days. Coinbase candles primary
+    (reachable from GitHub runners, keyless), CoinGecko as fallback."""
+    # 1. Coinbase daily candles: [time, low, high, open, close, volume]
+    if cb_pair:
+        end = dt.datetime.utcnow()
+        start = end - dt.timedelta(days=days)
+        url = ("https://api.exchange.coinbase.com/products/" + cb_pair +
+               "/candles?granularity=86400&start=" + start.strftime("%Y-%m-%dT%H:%M:%SZ") +
+               "&end=" + end.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        d = get_json(url)
+        try:
+            if isinstance(d, list) and len(d) >= 5:
+                # candles come newest-first; sort oldest-first and take close (idx 4)
+                rows = sorted(d, key=lambda r: r[0])
+                closes = [float(r[4]) for r in rows if len(r) >= 5 and r[4]]
+                if len(closes) >= 5:
+                    return closes
+        except (TypeError, ValueError, KeyError, IndexError):
+            pass
+    # 2. CoinGecko fallback
     url = ("https://api.coingecko.com/api/v3/coins/" + gecko_id +
            "/market_chart?vs_currency=usd&days=" + str(days) + "&interval=daily")
     d = get_json(url)
@@ -774,7 +793,7 @@ def main():
         coin_out = {"name": name, "spot": spot, "horizons": {}}
         valid = []
         # price history once per coin, reused for every horizon's models
-        hist = fetch_history(c["gecko"], 90) if spot else []
+        hist = fetch_history(c["gecko"], 90, c.get("cb")) if spot else []
         time.sleep(0.4)  # be gentle on the free history endpoint
         for hk in horizon_keys:
             target, _tol = targets[hk]
