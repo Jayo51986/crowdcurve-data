@@ -281,7 +281,7 @@ def fetch_kalshi():
                 break
             for mkt in d["markets"]:
                 seen += 1
-                if not dumped:  # show one real market so we can see field names
+                if not dumped and seen <= 1:  # one sample, for diagnostics
                     log("KALSHI SAMPLE [" + st + "]: " + json.dumps(mkt)[:1200])
                     dumped = True
                 try:
@@ -299,11 +299,29 @@ def fetch_kalshi():
                     if strike is None or direction is None:
                         continue
                     prob = None
-                    bid, ask = mkt.get("yes_bid"), mkt.get("yes_ask")
-                    if bid is not None and ask is not None and (bid or ask):
-                        prob = ((float(bid) + float(ask)) / 2.0) / 100.0
-                    elif mkt.get("last_price"):
-                        prob = float(mkt["last_price"]) / 100.0
+                    def fnum(*keys):
+                        for kk in keys:
+                            v = mkt.get(kk)
+                            if v not in (None, ""):
+                                try:
+                                    return float(v)
+                                except (TypeError, ValueError):
+                                    pass
+                        return None
+                    yb = fnum("yes_bid_dollars", "yes_bid")
+                    ya = fnum("yes_ask_dollars", "yes_ask")
+                    nb = fnum("no_bid_dollars", "no_bid")
+                    na = fnum("no_ask_dollars", "no_ask")
+                    if yb is not None and ya is not None and (yb or ya):
+                        prob = (yb + ya) / 2.0
+                    elif nb is not None and na is not None and (nb or na):
+                        prob = 1.0 - (nb + na) / 2.0  # yes = 1 - no
+                    else:
+                        lp = fnum("last_price_dollars", "previous_price_dollars")
+                        if lp is not None:
+                            prob = lp
+                    if prob is not None and prob > 1.5:  # cents, not dollars
+                        prob = prob / 100.0
                     if not prob or prob <= 0:
                         continue
                     if direction == "below":
@@ -311,8 +329,9 @@ def fetch_kalshi():
                     end = parse_date(mkt.get("close_time") or mkt.get("expiration_time") or mkt.get("expected_expiration_time"))
                     if end is None:
                         continue
+                    vol = fnum("volume", "open_interest_fp", "liquidity_dollars") or 0
                     out.append({"venue": "k", "coin": sym, "strike": strike,
-                                "prob": clamp(prob), "vol": float(mkt.get("volume") or 0), "end": end,
+                                "prob": clamp(prob), "vol": vol, "end": end,
                                 "q": str(mkt.get("title") or "")})
                 except (TypeError, ValueError, KeyError):
                     continue
@@ -549,4 +568,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
