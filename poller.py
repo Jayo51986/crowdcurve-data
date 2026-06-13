@@ -737,7 +737,8 @@ def update_scoring(config, today):
     log("scoring: " + str(scorecard["resolved"]) + " resolved, " + str(scorecard["open"]) + " open")
 
 
-
+def main():
+    today = dt.datetime.utcnow().date()
     targets = horizon_targets(today)
     spots = fetch_spots()
     if not spots:
