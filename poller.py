@@ -461,13 +461,17 @@ def horizon_targets(today):
     me = month_end(today)
     if (me - today).days < 4:  # month nearly over: roll to next month
         me = month_end(me + dt.timedelta(days=4))
+    # Quarter should mean "about a quarter out", not "end of this calendar
+    # quarter". If the nearest quarter-end is too close (or collides with the
+    # month target), roll to the following quarter so Q is always clearly
+    # further out than M.
     qe = quarter_end(today)
-    if (qe - today).days < 12:
-        qe = quarter_end(qe + dt.timedelta(days=12))
+    while (qe - today).days < 45 or qe <= me:
+        qe = quarter_end(qe + dt.timedelta(days=20))
     return {
         "W":  (today + dt.timedelta(days=7), 4),
         "M":  (me, 7),
-        "Q":  (qe, 16),
+        "Q":  (qe, 20),
         "Y":  (dt.date(today.year, 12, 31), 24),
         "Y1": (dt.date(today.year + 1, 12, 31), 45),
         "Y2": (dt.date(today.year + 2, 12, 31), 60),
@@ -493,10 +497,35 @@ def filter_outlier_strikes(points, spot, horizon_days):
     # scale plausible move with sqrt(time): ~weekly tight, multi-year wide
     import math as _m
     horizon_factor = _m.sqrt(max(horizon_days, 1) / 30.0)  # 1.0 at ~1 month
-    lo = spot / (1 + 1.1 * horizon_factor)
+    # Downside bounded much tighter than upside: thin sub-spot daily strikes must
+    # not drag a long-horizon distribution down to an implausible crash level.
+    lo_mult = max(0.45, 1 - 0.28 * horizon_factor)
+    lo = spot * lo_mult
     hi = spot * (1 + 1.6 * horizon_factor)
     kept = [p for p in points if lo <= p["strike"] <= hi]
-    return kept if len(kept) >= 3 else points
+    if len(kept) < 3:  # relax only the upper bound on sparse sets
+        kept = [p for p in points if p["strike"] >= lo]
+    kept = kept if len(kept) >= 3 else points
+    # Gap detection: if a small low cluster is separated from the main body by a
+    # large empty span (e.g. thin $18-29k strikes far below $90k+ year-end strikes),
+    # drop the low cluster. We split at the largest ratio-gap and keep the side
+    # holding most of the volume.
+    if len(kept) >= 4:
+        ks = sorted(kept, key=lambda p: p["strike"])
+        best_i, best_ratio = None, 2.2  # only act on >2.2x jumps
+        for i in range(1, len(ks)):
+            lo_s, hi_s = ks[i - 1]["strike"], ks[i]["strike"]
+            if lo_s > 0 and hi_s / lo_s > best_ratio:
+                best_ratio = hi_s / lo_s
+                best_i = i
+        if best_i is not None:
+            def vol(seg):
+                return sum((p.get("pmVol", 0) + p.get("kVol", 0)) for p in seg)
+            low_seg, high_seg = ks[:best_i], ks[best_i:]
+            keep_seg = high_seg if vol(high_seg) >= vol(low_seg) else low_seg
+            if len(keep_seg) >= 3:
+                kept = keep_seg
+    return kept
 
 
 # ── consensus math (same bucket method as the plugin) ────────────────────────
@@ -622,8 +651,8 @@ def fetch_macro():
     """Live macro markets from Kalshi that move crypto. Falls back to a small
     static set only if the API is unreachable, clearly flagged stale."""
     wanted = [
-        ("KXFED", "Fed cuts rates by September"),
-        ("KXCPI", "Inflation comes in hot this month"),
+        ("KXFED", "Interest rates change at the next decision"),
+        ("KXCPI", "Inflation comes in higher than expected"),
         ("KXRECSS", "US recession called this year"),
     ]
     out = []
