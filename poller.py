@@ -331,6 +331,67 @@ def fetch_polymarket():
     return out
 
 
+# ── Deribit (options-implied) ────────────────────────────────────────────────
+
+def fetch_deribit():
+    """Convert Deribit's options chain into threshold probabilities, matching the
+    {venue, coin, strike, prob, vol, end, q} shape used by the other venues.
+
+    Honest method note: for a European call, the risk-neutral probability that
+    the price finishes above the strike is closely tracked by the call's delta.
+    Deribit's public ticker returns greeks (delta) per option, so we read the
+    delta of each call as the market-implied 'chance price > strike' at expiry.
+    This is an approximation (delta also carries a small volatility term), but it
+    is a real, options-derived probability, not a model we invented. Deribit's
+    public market-data API needs no key.
+    """
+    out = []
+    currencies = {"BTC": "BTC", "ETH": "ETH"}  # Deribit lists options for BTC, ETH
+    for sym, cur in currencies.items():
+        instruments = get_json(
+            "https://www.deribit.com/api/v2/public/get_instruments"
+            f"?currency={cur}&kind=option&expired=false"
+        )
+        if not instruments or "result" not in instruments:
+            continue
+        # group calls by expiry; we only need calls (delta = P[above strike])
+        calls = [i for i in instruments["result"]
+                 if i.get("option_type") == "call" and i.get("strike")]
+        # limit the number of ticker calls to stay polite on rate limits
+        calls = sorted(calls, key=lambda i: (i.get("expiration_timestamp", 0), i.get("strike", 0)))
+        seen = 0
+        for inst in calls:
+            if seen >= 240:  # safety cap per currency
+                break
+            name = inst.get("instrument_name")
+            strike = inst.get("strike")
+            exp_ms = inst.get("expiration_timestamp")
+            if not name or not strike or not exp_ms:
+                continue
+            tk = get_json(f"https://www.deribit.com/api/v2/public/ticker?instrument_name={name}")
+            seen += 1
+            time.sleep(0.15)
+            if not tk or "result" not in tk:
+                continue
+            r = tk["result"]
+            greeks = r.get("greeks") or {}
+            delta = greeks.get("delta")
+            if delta is None:
+                continue
+            # call delta ~ P[S_T > K]; clamp to a sane probability
+            prob = clamp(float(delta))
+            end = dt.datetime.utcfromtimestamp(exp_ms / 1000.0).date()
+            # volume proxy: open interest * underlying price (USD-ish notional)
+            oi = float(r.get("open_interest") or 0)
+            under = float(r.get("underlying_price") or r.get("index_price") or 0)
+            vol = oi * under
+            out.append({"venue": "d", "coin": sym, "strike": float(strike),
+                        "prob": prob, "vol": vol, "end": end,
+                        "q": f"{sym} > {int(strike)} call (Deribit {end})"})
+    log(f"deribit: {len(out)} option-implied threshold points parsed")
+    return out
+
+
 # ── Kalshi ───────────────────────────────────────────────────────────────────
 
 def kalshi_coin(mkt):
@@ -532,35 +593,44 @@ def filter_outlier_strikes(points, spot, horizon_days):
 
 def merge_strikes(points):
     """Group venue points at near-identical strikes into rows of
-    {strike, pm, k, pmVol, kVol}, monotonically cleaned."""
+    {strike, pm, k, d, pmVol, kVol, dVol}, monotonically cleaned."""
     points = sorted(points, key=lambda p: p["strike"])
     rows = []
     for p in points:
         if rows and abs(p["strike"] - rows[-1]["strike"]) / max(rows[-1]["strike"], 1e-9) < 0.005:
             row = rows[-1]
         else:
-            row = {"strike": p["strike"], "pm": None, "k": None, "pmVol": 0, "kVol": 0}
+            row = {"strike": p["strike"], "pm": None, "k": None, "d": None,
+                   "pmVol": 0, "kVol": 0, "dVol": 0}
             rows.append(row)
         if p["venue"] == "pm":
             row["pm"] = p["prob"] if row["pm"] is None else (row["pm"] + p["prob"]) / 2
             row["pmVol"] += p["vol"]
+        elif p["venue"] == "d":
+            row["d"] = p["prob"] if row["d"] is None else (row["d"] + p["prob"]) / 2
+            row["dVol"] += p["vol"]
         else:
             row["k"] = p["prob"] if row["k"] is None else (row["k"] + p["prob"]) / 2
             row["kVol"] += p["vol"]
-    for row in rows:  # single-venue rows mirror the present venue
+    for row in rows:  # fill missing venues from whatever is present
+        present = [x for x in (row["pm"], row["k"], row["d"]) if x is not None]
+        fallback = sum(present) / len(present) if present else 0.0
         if row["pm"] is None:
-            row["pm"] = row["k"]
+            row["pm"] = fallback
         if row["k"] is None:
-            row["k"] = row["pm"]
-    # enforce non-increasing survival as strikes rise
+            row["k"] = fallback
+        if row["d"] is None:
+            row["d"] = fallback
+    # enforce non-increasing survival as strikes rise (use the 3-venue average)
     prev = 1.0
     for row in rows:
-        avg = (row["pm"] + row["k"]) / 2
+        avg = (row["pm"] + row["k"] + row["d"]) / 3
         if avg > prev:
             scale = prev / avg if avg else 1
             row["pm"] = clamp(row["pm"] * scale)
             row["k"] = clamp(row["k"] * scale)
-        prev = (row["pm"] + row["k"]) / 2
+            row["d"] = clamp(row["d"] * scale)
+        prev = (row["pm"] + row["k"] + row["d"]) / 3
     return rows
 
 
@@ -569,10 +639,10 @@ def summarize(spot, rows):
     tot = sum(r["pmVol"] + r["kVol"] for r in rows) or 1.0
 
     def cons(r):
-        v = r["pmVol"] + r["kVol"]
+        v = r["pmVol"] + r["kVol"] + r.get("dVol", 0)
         if v > 0:
-            return (r["pm"] * r["pmVol"] + r["k"] * r["kVol"]) / v
-        return (r["pm"] + r["k"]) / 2
+            return (r["pm"] * r["pmVol"] + r["k"] * r["kVol"] + r["d"] * r.get("dVol", 0)) / v
+        return (r["pm"] + r["k"] + r["d"]) / 3
 
     surv = [1.0] + [clamp(cons(r), 0.0, 1.0) for r in rows] + [0.0]
     for i in range(1, len(surv)):
@@ -793,7 +863,7 @@ def main():
         log("FATAL: no spot prices available; aborting without writing")
         sys.exit(1)
 
-    raw = fetch_polymarket() + fetch_kalshi()
+    raw = fetch_polymarket() + fetch_kalshi() + fetch_deribit()
     log(f"total raw threshold markets: {len(raw)}")
 
     # bucket: coin -> horizon -> [points]
@@ -836,13 +906,15 @@ def main():
                 strikes = [r["strike"] for r in rows]
                 market_cons = []
                 for r in rows:
-                    v = r["pmVol"] + r["kVol"]
-                    market_cons.append((r["pm"] * r["pmVol"] + r["k"] * r["kVol"]) / v if v > 0 else (r["pm"] + r["k"]) / 2)
+                    v = r["pmVol"] + r["kVol"] + r.get("dVol", 0)
+                    market_cons.append((r["pm"] * r["pmVol"] + r["k"] * r["kVol"] + r["d"] * r.get("dVol", 0)) / v if v > 0 else (r["pm"] + r["k"] + r["d"]) / 3)
                 models = build_models(spot, strikes, market_cons, hist, HDAYS.get(hk, 30)) if hist else {}
                 coin_out["horizons"][hk] = {
                     "resolve": label,
                     "markets": [{"strike": r["strike"], "pm": round(r["pm"], 4), "k": round(r["k"], 4),
-                                 "pmVol": round(r["pmVol"]), "kVol": round(r["kVol"])} for r in rows],
+                                 "d": round(r["d"], 4),
+                                 "pmVol": round(r["pmVol"]), "kVol": round(r["kVol"]),
+                                 "dVol": round(r.get("dVol", 0))} for r in rows],
                     "summary": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in summary.items()},
                     "models": models,
                 }
