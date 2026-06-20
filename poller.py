@@ -601,8 +601,20 @@ def merge_strikes(points):
             row = rows[-1]
         else:
             row = {"strike": p["strike"], "pm": None, "k": None, "d": None,
-                   "pmVol": 0, "kVol": 0, "dVol": 0}
+                   "pmVol": 0, "kVol": 0, "dVol": 0, "q": "", "qsrc": ""}
             rows.append(row)
+        # keep the question from the highest-volume market, but prefer the
+        # human-readable prediction-market wording over Deribit's synthetic
+        # "BTC > 70000 call" strings.
+        if p.get("q"):
+            is_pred = p["venue"] in ("pm", "k")
+            cur_pred = row.get("_qpred", False)
+            better = (is_pred and not cur_pred) or (is_pred == cur_pred and p["vol"] >= row.get("_qvol", -1))
+            if better:
+                row["q"] = p["q"]
+                row["qsrc"] = {"pm": "Polymarket", "k": "Kalshi", "d": "Deribit"}.get(p["venue"], "")
+                row["_qvol"] = p["vol"]
+                row["_qpred"] = is_pred
         if p["venue"] == "pm":
             row["pm"] = p["prob"] if row["pm"] is None else (row["pm"] + p["prob"]) / 2
             row["pmVol"] += p["vol"]
@@ -914,7 +926,8 @@ def main():
                     "markets": [{"strike": r["strike"], "pm": round(r["pm"], 4), "k": round(r["k"], 4),
                                  "d": round(r["d"], 4),
                                  "pmVol": round(r["pmVol"]), "kVol": round(r["kVol"]),
-                                 "dVol": round(r.get("dVol", 0))} for r in rows],
+                                 "dVol": round(r.get("dVol", 0)),
+                                 "q": r.get("q", ""), "qsrc": r.get("qsrc", "")} for r in rows],
                     "summary": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in summary.items()},
                     "models": models,
                 }
