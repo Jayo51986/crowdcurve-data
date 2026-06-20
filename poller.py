@@ -381,10 +381,16 @@ def fetch_deribit():
             # call delta ~ P[S_T > K]; clamp to a sane probability
             prob = clamp(float(delta))
             end = dt.datetime.utcfromtimestamp(exp_ms / 1000.0).date()
-            # volume proxy: open interest * underlying price (USD-ish notional)
+            # Volume proxy. Deribit open-interest notional (OI * price) runs in
+            # the hundreds of millions — a totally different scale from Polymarket
+            # and Kalshi dollar volume (thousands). Left raw, Deribit would dwarf
+            # the consensus weighting and print absurd "$399,748K" figures. We
+            # scale it down to a comparable order of magnitude so the three
+            # venues blend sensibly. This is a deliberate normalisation, not a
+            # real dollar figure, so we keep it modest.
             oi = float(r.get("open_interest") or 0)
             under = float(r.get("underlying_price") or r.get("index_price") or 0)
-            vol = oi * under
+            vol = (oi * under) * 0.001  # normalise OI-notional toward $-volume scale
             out.append({"venue": "d", "coin": sym, "strike": float(strike),
                         "prob": prob, "vol": vol, "end": end,
                         "q": f"{sym} > {int(strike)} call (Deribit {end})"})
