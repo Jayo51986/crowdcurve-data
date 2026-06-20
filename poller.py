@@ -938,6 +938,38 @@ def main():
                 if spot:
                     write_json(os.path.join(OUT_DIR, sym, hk),
                                no_market_text(sym, name, spot, hk))
+        # Top distinct questions across all of this coin's raw markets (every
+        # horizon), most-traded first, for the live betting feed. We dedupe by
+        # question text and keep the heaviest-volume version of each.
+        all_pts = []
+        for _hk in horizon_keys:
+            all_pts.extend(grouped.get(sym, {}).get(_hk, []))
+        qmap = {}
+        for p in all_pts:
+            qtext = (p.get("q") or "").strip()
+            if not qtext or p["venue"] == "d":  # skip synthetic Deribit strings
+                continue
+            cur = qmap.get(qtext)
+            if cur is None or p["vol"] > cur["vol"]:
+                qmap[qtext] = {
+                    "q": qtext,
+                    "src": {"pm": "Polymarket", "k": "Kalshi"}.get(p["venue"], ""),
+                    "prob": round(clamp(p["prob"]), 3),
+                    "vol": p["vol"],
+                    "end": p["end"].isoformat() if hasattr(p["end"], "isoformat") else "",
+                }
+        top_q = sorted(qmap.values(), key=lambda x: x["vol"], reverse=True)[:15]
+        for q in top_q:
+            q["vol"] = round(q["vol"])
+        coin_out["top_questions"] = top_q
+        # Aggregate money + lean for the all-coin leaderboard.
+        tot_vol = round(sum(p["vol"] for p in all_pts))
+        # bullish money = volume on "above" markets resolving yes-ish; we proxy
+        # lean by volume-weighted average probability of the "above spot" markets.
+        up_vol = round(sum(p["vol"] for p in all_pts if spot and p["strike"] >= spot))
+        dn_vol = round(sum(p["vol"] for p in all_pts if spot and p["strike"] < spot))
+        coin_out["flow"] = {"total": tot_vol, "up": up_vol, "down": dn_vol,
+                            "questions": len(qmap)}
         coin_out["tier"] = "full" if ("M" in valid and len(valid) >= 3) else ("partial" if valid else "spot")
         config["coins"][sym] = coin_out
         log(f"{sym}: tier={coin_out['tier']} horizons={valid} spot={spot}")
